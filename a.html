@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>リアルタイム手ぶれ補正カメラ (単一ファイル)</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background-color: #333;
+            color: white;
+            font-family: sans-serif;
+        }
+        #cameraFeed {
+            display: none; /* カメラ映像は直接表示せず、canvasに描画 */
+        }
+        #outputCanvas {
+            width: 100vw;
+            height: 100vh;
+            object-fit: contain; /* 画面にフィットさせる */
+            background-color: black;
+        }
+        #controls {
+            position: absolute;
+            bottom: 20px;
+            background-color: rgba(0, 0, 0, 0.5);
+            padding: 10px 20px;
+            border-radius: 10px;
+            display: flex;
+            gap: 10px;
+        }
+        button {
+            padding: 10px 15px;
+            font-size: 16px;
+            border: none;
+            border-radius: 5px;
+            background-color: #007bff;
+            color: white;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        #status {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background-color: rgba(0, 0, 0, 0.5);
+            padding: 5px 10px;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+    </style>
+    <!-- gl-matrix ライブラリをCDNから読み込み -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/gl-matrix/3.4.3/gl-matrix-min.js"></script>
+</head>
+<body>
+    <div id="status">Status: Loading...</div>
+    <video id="cameraFeed" playsinline autoplay muted></video>
+    <canvas id="outputCanvas"></canvas>
+    <div id="controls">
+        <button id="startButton">カメラ開始</button>
+        <button id="requestSensorButton" style="display: none;">センサー許可</button>
+    </div>
+
+    <script>
+        // gl-matrix のエイリアス
+        const vec3 = glMatrix.vec3;
+        const quat = glMatrix.quat;
+        const mat4 = glMatrix.mat4;
+
+        // --- MadgwickAHRS フィルターの実装 (簡易版) ---
+        // 実際のライブラリを使う方が良いですが、ここでは基本的なロジックを記述
+        class MadgwickAHRS {
+            constructor(sampleRate = 100, beta = 0.1) {
+                this.sampleRate = sampleRate; // Hz
+                this.beta = beta; // ゲイン
+                this.q = quat.fromValues(1, 0, 0, 0); // 姿勢クォータニオン (w, x, y, z)
+            }
+
+            update(gx, gy, gz, ax, ay, az) {
+                // gx, gy, gz: ジャイロスコープ (rad/s)
+                // ax, ay, az: 加速度計 (g)
+
+                let q = this.q;
+                let recipNorm;
+                let s0, s1, s2, s3;
+                let qDot1, qDot2, qDot3, qDot4;
+                let _2q0, _2q1, _2q2, _2q3, _4q0, _4q1, _4q2, _8q1, _8q2, qcb;
+
+                // Auxiliary variables to avoid repeated calculations
+                _2q0 = 2.0 * q[0];
+                _2q1 = 2.0 * q[1];
+                _2q2 = 2.0 * q[2];
+                _2q3 = 2.0 * q[3];
+                _4q0 = 4.0 * q[0];
+                _4q1 = 4.0 * q[1];
+                _4q2 = 4.0 * q[2];
+                _8q1 = 8.0 * q[1];
+                _8q2 = 8.0 * q[2];
+
+                // Normalize accelerometer measurement
+                recipNorm = 1.0 / Math.sqrt(ax * ax + ay * ay + az * az);
+                ax *= recipNorm;
+                ay *= recipNorm;
+                az *= recipNorm;
+
+                // Gradient decent algorithm corrective step
+                s0 = -_2q2 * (2 * q[1] * q[3] - _2q0 * q[2] - ax) + _2q1 * (2 * q[0] * q[1] + _2q2 * q[3] - ay) - _2q0 * (1 - 2 * q[1] * q[1] - 2 * q[2] * q[2] - az);
+                s1 = _2q3 * (2 * q[1] * q[3] - _2q0 * q[2] - ax) + _2q0 * (2 * q[0] * q[1] + _2q2 * q[3] - ay) - 4 * q[1] * (1 - 2 * q[1] * q[1] - 2 * q[2] * q[2] - az);
+                s2 = -_2q0 * (2 * q[1] * q[3] - _2q0 * q[2] - ax) + _2q3 * (2 * q[0] * q[1] + _2q2 * q[3] - ay) - 4 * q[2] * (1 - 2 * q[1] * q[1] - 2 * q[2] * q[2] - az);
+                s3 = _2q1 * (2 * q[1] * q[3] - _2q0 * q[2] - ax) + _2q2 * (2 * q[0] * q[1] + _2q2 * q[3] - ay);
+                recipNorm = 1.0 / Math.sqrt(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3); // normalise gradient
+                s0 *= recipNorm;
+                s1 *= recipNorm;
+                s2 *= recipNorm;
+                s3 *= recipNorm;
+
+                // Rate of change of quaternion from gyroscope
+                qDot1 = 0.5 * (-q[1] * gx - q[2] * gy - q[3] * gz);
+                qDot2 = 0.5 * (q[0] * gx + q[2] * gz - q[3] * gy);
+                qDot3 = 0.5 * (q[0] * gy - q[1] * gz + q[3] * gx);
+                qDot4 = 0.5 * (q[0] * gz + q[1] * gy - q[2] * gx);
+
+                // Compute and integrate the rate of change of the quaternion
+                q[0] += (qDot1 - this.beta * s0) * (1.0 / this.sampleRate);
+                q[1] += (qDot2 - this.beta * s1) * (1.0 / this.sampleRate);
+                q[2] += (qDot3 - this.beta * s2) * (1.0 / this.sampleRate);
+                q[3] += (qDot4 - this.beta * s3) * (1.0 / this.sampleRate);
+
+                this.q = quat.normalize(q, q); // Normalize quaternion
+            }
+        }
+
+        // --- グローバル変数 ---
+        const video = document.getElementById('cameraFeed');
+        const canvas = document.getElementById('outputCanvas');
+        const ctx = canvas.getContext('webgl');
+        const startButton = document.getElementById('startButton');
+        const requestSensorButton = document.getElementById('requestSensorButton');
+        const statusDiv = document.getElementById('status');
+
+        let stream = null;
+        let madgwick = null;
+        let lastMotionTimestamp = 0;
+        let sensorData = {
+            alpha: 0, beta: 0, gamma: 0, // DeviceOrientationEvent (未使用だが参考)
+            gx: 0, gy: 0, gz: 0, // ジャイロスコープ (rad/s)
+            ax: 0, ay: 0, az: 0  // 加速度計 (m/s^2)
+        };
+
+        let program;
+        let positionBuffer;
+        let texCoordBuffer;
+        let texture;
+        let u_imageLoc;
+        let u_transformMatrixLoc;
+
+        // --- WebGL シェーダー ---
+        const vsSource = `
+            attribute vec4 a_position;
+            attribute vec2 a_texCoord;
+            uniform mat4 u_transformMatrix;
+            varying vec2 v_texCoord;
+
+            void main() {
+                gl_Position = u_transformMatrix * a_position;
+                v_texCoord = a_texCoord;
+            }
+        `;
+
+        const fsSource = `
+            precision mediump float;
+            uniform sampler2D u_image;
+            varying vec2 v_texCoord;
+
+            void main() {
+                gl_FragColor = texture2D(u_image, v_texCoord);
+            }
+        `;
+
+        // --- 初期化関数 ---
+        async function initCamera() {
+            try {
+                statusDiv.textContent = 'Status: カメラアクセスを要求中...';
+                stream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        facingMode: 'environment', // 背面カメラ
+                        width: { ideal: 1280 },
+                        height: { ideal: 720 }
+                    }
+                });
+                video.srcObject = stream;
+                await video.play();
+                statusDiv.textContent = 'Status: カメラ起動中...';
+
+                // カメラの解像度に合わせてキャンバスサイズを設定
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+
+                initWebGL();
+                requestAnimationFrame(renderLoop); // レンダリングループ開始
+                startButton.style.display = 'none';
+
+                // iOS 13+ でのセンサー許可ボタン表示
+                if (typeof DeviceMotionEvent.requestPermission === 'function') {
+                    requestSensorButton.style.display = 'block';
+                    statusDiv.textContent = 'Status: センサー許可待ち...';
+                } else {
+                    initSensors(); // それ以外の環境では直接センサーを初期化
+                }
+
+            } catch (err) {
+                console.error('カメラアクセスエラー:', err);
+                statusDiv.textContent = `Status: カメラエラー: ${err.name}`;
+                alert('カメラにアクセスできませんでした。HTTPS接続か、カメラの許可を確認してください。');
+            }
+        }
+
+        function initSensors() {
+            statusDiv.textContent = 'Status: センサー初期化中...';
+            madgwick = new MadgwickAHRS(60, 0.1); // 60Hz更新、β=0.1
+
+            window.addEventListener('devicemotion', handleDeviceMotion);
+            // window.addEventListener('deviceorientation', handleDeviceOrientation); // 必要であれば
+
+            statusDiv.textContent = 'Status: センサー稼働中。';
+            requestSensorButton.style.display = 'none';
+        }
+
+        function handleDeviceMotion(event) {
+            const currentTime = performance.now();
+            if (lastMotionTimestamp === 0) {
+                lastMotionTimestamp = currentTime;
+                return;
+            }
+
+            const dt = (currentTime - lastMotionTimestamp) / 1000.0; // 秒単位
+            lastMotionTimestamp = currentTime;
+
+            // 加速度計データ (m/s^2)
+            sensorData.ax = event.accelerationIncludingGravity.x;
+            sensorData.ay = event.accelerationIncludingGravity.y;
+            sensorData.az = event.accelerationIncludingGravity.z;
+
+            // ジャイロスコープデータ (rad/s)
+            // iOSでは degrees/s で提供されることがあるため、rad/s に変換
+            // 注意: iOSのrotationRate.alpha/beta/gammaは、それぞれZ, X, Y軸周りの回転に対応します。
+            // これは一般的な慣性センサーの座標系とは異なる場合があります。
+            // Madgwickフィルターの入力軸と合わせる必要があります。
+            // ここでは、Madgwickのgx, gy, gzをそれぞれデバイスのZ, X, Y軸回転と仮定しています。
+            sensorData.gx = event.rotationRate.alpha * Math.PI / 180; // Z軸 (yaw)
+            sensorData.gy = event.rotationRate.beta * Math.PI / 180;  // X軸 (pitch)
+            sensorData.gz = event.rotationRate.gamma * Math.PI / 180; // Y軸 (roll)
+
+            // Madgwickフィルターを更新
+            if (madgwick) {
+                // Madgwickフィルターは通常、重力加速度を1gとして正規化された加速度計データを使用します。
+                // ここでは簡易的に、加速度計データをそのまま渡していますが、
+                // 実際のMadgwickフィルターは重力加速度の大きさを考慮した正規化が必要です。
+                // また、ジャイロの軸と加速度計の軸がデバイスによって異なる場合があるので注意。
+                madgwick.update(sensorData.gx, sensorData.gy, sensorData.gz,
+                                sensorData.ax, sensorData.ay, sensorData.az);
+            }
+        }
+
+        function initWebGL() {
+            if (!ctx) {
+                alert('WebGLが利用できません。お使いのブラウザが対応しているか確認してください。');
+                return;
+            }
+
+            // シェーダーのコンパイル
+            const vertexShader = loadShader(ctx, ctx.VERTEX_SHADER, vsSource);
+            const fragmentShader = loadShader(ctx, ctx.FRAGMENT_SHADER, fsSource);
+
+            program = ctx.createProgram();
+            ctx.attachShader(program, vertexShader);
+            ctx.attachShader(program, fragmentShader);
+            ctx.linkProgram(program);
+
+            if (!ctx.getProgramParameter(program, ctx.LINK_STATUS)) {
+                console.error('Unable to initialize the shader program: ' + ctx.getProgramInfoLog(program));
+                return null;
+            }
+
+            ctx.useProgram(program);
+
+            // 頂点バッファ (四角形)
+            positionBuffer = ctx.createBuffer();
+            ctx.bindBuffer(ctx.ARRAY_BUFFER, positionBuffer);
+            const positions = [
+                -1.0,  1.0, // Top-left
+                 1.0,  1.0, // Top-right
+                -1.0, -1.0, // Bottom-left
+                 1.0, -1.0, // Bottom-right
+            ];
+            ctx.bufferData(ctx.ARRAY_BUFFER, new Float32Array(positions), ctx.STATIC_DRAW);
+
+            // テクスチャ座標バッファ
+            texCoordBuffer = ctx.createBuffer();
+            ctx.bindBuffer(ctx.ARRAY_BUFFER, texCoordBuffer);
+            const texCoords = [
+                0.0, 0.0, // Top-left
+                1.0, 0.0, // Top-right
+                0.0, 1.0, // Bottom-left
+                1.0, 1.0, // Bottom-right
+            ];
+            ctx.bufferData(ctx.ARRAY_BUFFER, new Float32Array(texCoords), ctx.STATIC_DRAW);
+
+            // テクスチャの作成
+            texture = ctx.createTexture();
+            ctx.bindTexture(ctx.TEXTURE_2D, texture);
+
+            // テクスチャパラメータの設定
+            ctx.texParameteri(ctx.TEXTURE_2D, ctx.TEXTURE_WRAP_S, ctx.CLAMP_TO_EDGE);
+            ctx.texParameteri(ctx.TEXTURE_2D, ctx.TEXTURE_WRAP_T, ctx.CLAMP_TO_EDGE);
+            ctx.texParameteri(ctx.TEXTURE_2D, ctx.TEXTURE_MIN_FILTER, ctx.LINEAR);
+            ctx.texParameteri(ctx.TEXTURE_2D, ctx.TEXTURE_MAG_FILTER, ctx.LINEAR);
+
+            // uniformロケーションの取得
+            u_imageLoc = ctx.getUniformLocation(program, 'u_image');
+            u_transformMatrixLoc = ctx.getUniformLocation(program, 'u_transformMatrix');
+
+            // attributeロケーションの取得と有効化
+            const a_positionLoc = ctx.getAttribLocation(program, 'a_position');
+            ctx.bindBuffer(ctx.ARRAY_BUFFER, positionBuffer);
+            ctx.vertexAttribPointer(a_positionLoc, 2, ctx.FLOAT, false, 0, 0);
+            ctx.enableVertexAttribArray(a_positionLoc);
+
+            const a_texCoordLoc = ctx.getAttribLocation(program, 'a_texCoord');
+            ctx.bindBuffer(ctx.ARRAY_BUFFER, texCoordBuffer);
+            ctx.vertexAttribPointer(a_texCoordLoc, 2, ctx.FLOAT, false, 0, 0);
+            ctx.enableVertexAttribArray(a_texCoordLoc);
+        }
+
+        function loadShader(gl, type, source) {
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                console.error('An error occurred compiling the shaders: ' + gl.getShaderInfoLog(shader));
+                gl.deleteShader(shader);
+                return null;
+            }
+            return shader;
+        }
+
+        // --- レンダリングループ ---
+        function renderLoop() {
+            if (video.readyState === video.HAVE_ENOUGH_DATA) {
+                ctx.clearColor(0.0, 0.0, 0.0, 1.0);
+                ctx.clear(ctx.COLOR_BUFFER_BIT);
+
+                // カメラ映像をテクスチャにアップロード
+                ctx.bindTexture(ctx.TEXTURE_2D, texture);
+                ctx.texImage2D(ctx.TEXTURE_2D, 0, ctx.RGBA, ctx.RGBA, ctx.UNSIGNED_BYTE, video);
+
+                // 変換行列の計算
+                let transformMatrix = mat4.create();
+
+                if (madgwick) {
+                    // Madgwickフィルターから得られた姿勢クォータニオン
+                    const currentQuaternion = madgwick.q;
+
+                    // クォータニオンから回転行列を生成
+                    let rotationMatrix = mat4.create();
+                    mat4.fromQuat(rotationMatrix, currentQuaternion);
+
+                    // 手ぶれ補正のための逆変換行列を適用
+                    // ここでは、デバイスの回転を打ち消すために、逆回転を適用します。
+                    // 実際の補正では、カメラの初期姿勢からの相対的な動きを計算し、
+                    // その逆変換を適用する必要があります。
+                    // また、カメラの画角やセンサーの取り付け方向も考慮に入れる必要があります。
+                    mat4.invert(transformMatrix, rotationMatrix);
+
+                    // 補正によって映像が小さくなるのを防ぐため、少し拡大する
+                    // これは簡易的な対応であり、実際の補正では画角の維持やクロッピングを考慮
+                    mat4.scale(transformMatrix, transformMatrix, vec3.fromValues(1.1, 1.1, 1.0));
+                } else {
+                    // センサーデータがない場合は、単位行列（変形なし）
+                    mat4.identity(transformMatrix);
+                }
+
+                // uniform変数に変換行列を渡す
+                ctx.uniformMatrix4fv(u_transformMatrixLoc, false, transformMatrix);
+
+                // 描画
+                ctx.drawArrays(ctx.TRIANGLE_STRIP, 0, 4);
+            }
+
+            requestAnimationFrame(renderLoop);
+        }
+
+        // --- イベントリスナー ---
+        startButton.addEventListener('click', initCamera);
+
+        requestSensorButton.addEventListener('click', async () => {
+            if (typeof DeviceMotionEvent.requestPermission === 'function') {
+                try {
+                    const permissionState = await DeviceMotionEvent.requestPermission();
+                    if (permissionState === 'granted') {
+                        initSensors();
+                    } else {
+                        statusDiv.textContent = 'Status: センサーアクセスが拒否されました。';
+                        alert('モーションセンサーへのアクセスが許可されませんでした。手ぶれ補正は動作しません。');
+                    }
+                } catch (error) {
+                    console.error('DeviceMotionEvent.requestPermission error:', error);
+                    statusDiv.textContent = `Status: センサー許可エラー: ${error.name}`;
+                    alert('モーションセンサーの許可に失敗しました。');
+                }
+            }
+        });
+
+        // 初期状態のステータス表示
+        statusDiv.textContent = 'Status: 準備完了。カメラ開始ボタンを押してください。';
+    </script>
+</body>
+</html>
